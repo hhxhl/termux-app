@@ -35,8 +35,22 @@ jobs:
       - name: Install Android build tools
         run: sdkmanager --install 'build-tools;36.0.0'
 
+
+      - name: Download Termux bootstraps
+        run: |
+          ./gradlew :app:downloadBootstraps --no-daemon
+
+          for arch in aarch64 arm i686 x86_64; do
+            file="app/src/main/cpp/bootstrap-${arch}.zip"
+            test -s "$file" || {
+              echo "Missing bootstrap: $file"
+              exit 1
+            }
+          done
+
       - name: Build unsigned release APK
         run: ./gradlew :app:assembleRelease --no-daemon
+
 
       - name: Align, sign, and verify
         shell: bash
