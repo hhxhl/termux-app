@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - hhxhl-master
       - 'github-releases/**'
   pull_request:
     branches:
