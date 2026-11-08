@@ -11,11 +11,11 @@ permissions:
 
 jobs:
   build:
-    if: github.repository == 'hhxhl/termux-app'
+    if: github.repository == 'hhxhl/termux-app' && github.ref == 'refs/heads/hhxhl-master'
     runs-on: ubuntu-24.04
     env:
       TERMUX_PACKAGE_VARIANT: apt-android-7
-      TERMUX_SPLIT_APKS_FOR_RELEASE_BUILDS: '0'
+      TERMUX_SPLIT_APKS_FOR_RELEASE_BUILDS: '1'
 
     steps:
       - name: Checkout sources
@@ -35,22 +35,35 @@ jobs:
       - name: Install Android build tools
         run: sdkmanager --install 'build-tools;36.0.0'
 
+      - name: Restrict build to arm64-v8a
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          path = Path('app/build.gradle')
+          source = path.read_text()
+          replacements = (
+              ("include 'x86', 'x86_64', 'armeabi-v7a', 'arm64-v8a'", "include 'arm64-v8a'"),
+              ('universalApk true', 'universalApk false'),
+          )
+          for original, replacement in replacements:
+              if source.count(original) != 1:
+                  raise SystemExit(f'Expected exactly one occurrence: {original}')
+              source = source.replace(original, replacement, 1)
+          path.write_text(source)
+          print('Release ABI limited to arm64-v8a; universal APK disabled.')
+          PYCODE
 
       - name: Download Termux bootstraps
         run: |
           ./gradlew :app:downloadBootstraps --no-daemon
-
           for arch in aarch64 arm i686 x86_64; do
             file="app/src/main/cpp/bootstrap-${arch}.zip"
-            test -s "$file" || {
-              echo "Missing bootstrap: $file"
-              exit 1
-            }
+            test -s "$file" || { echo "Missing bootstrap: $file"; exit 1; }
           done
 
       - name: Build unsigned release APK
         run: ./gradlew :app:assembleRelease --no-daemon
-
 
       - name: Align, sign, and verify
         shell: bash
@@ -66,16 +79,16 @@ jobs:
             echo 'Missing Android signing secrets' >&2
             exit 1
           fi
-
+          # For a single-password keystore, ANDROID_KEY_PASSWORD may be omitted.
           export ANDROID_KEY_PASSWORD="${ANDROID_KEY_PASSWORD:-$ANDROID_KEYSTORE_PASSWORD}"
 
           umask 077
           keystore="$RUNNER_TEMP/termux-release.keystore"
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
 
+          # Detect JKS or PKCS12 to support existing signing files.
           ks_type="$(keytool -list -keystore "$keystore" -storepass:env ANDROID_KEYSTORE_PASSWORD \
             | sed -nE 's/^Keystore type: (JKS|PKCS12)$/\1/p' | head -n 1)"
-
           if [[ -z "$ks_type" ]]; then
             echo 'Cannot detect keystore type (JKS/PKCS12)' >&2
             exit 1
@@ -83,22 +96,23 @@ jobs:
 
           apk_dir='app/build/outputs/apk/release'
           mapfile -t apks < <(find "$apk_dir" -maxdepth 1 -type f -name '*.apk')
-
           if [[ "${#apks[@]}" -ne 1 ]]; then
             echo "Expected one release APK, found ${#apks[@]}" >&2
             find "$apk_dir" -maxdepth 1 -type f -print
+            exit 1
+          fi
+          if [[ "$(basename "${apks[0]}")" != *_arm64-v8a.apk ]]; then
+            echo "Unexpected APK name: ${apks[0]} (expected arm64-v8a)" >&2
             exit 1
           fi
 
           sdk_dir="${ANDROID_HOME:-${ANDROID_SDK_ROOT:?Android SDK path missing}}"
           tools="$sdk_dir/build-tools/36.0.0"
           aligned="$RUNNER_TEMP/termux-release-aligned.apk"
-
           mkdir -p dist
-          signed='dist/termux-hhxhl-apt-android-7-release-signed-universal.apk'
+          signed='dist/termux-hhxhl-apt-android-7-release-signed-arm64-v8a.apk'
 
           "$tools/zipalign" -P 16 -f 4 "${apks[0]}" "$aligned"
-
           "$tools/apksigner" sign \
             --ks "$keystore" \
             --ks-type "$ks_type" \
@@ -111,6 +125,19 @@ jobs:
           "$tools/apksigner" verify --verbose --print-certs "$signed"
           "$tools/zipalign" -c -P 16 4 "$signed"
 
+          # Verify the signed APK really contains only arm64-v8a native libraries.
+          mapfile -t native_libs < <(unzip -Z1 "$signed" | grep -E '^lib/[^/]+/.+' || true)
+          if [[ "${#native_libs[@]}" -eq 0 ]]; then
+            echo 'No native libraries found in APK' >&2
+            exit 1
+          fi
+          for lib in "${native_libs[@]}"; do
+            case "$lib" in
+              lib/arm64-v8a/*) ;;
+              *) echo "Unexpected ABI in APK: $lib" >&2; exit 1 ;;
+            esac
+          done
+          echo 'Verified: only arm64-v8a native libraries are packaged.'
           sha256sum "$signed" > "${signed}.sha256"
           rm -f "$keystore"
 
